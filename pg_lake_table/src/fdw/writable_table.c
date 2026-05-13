@@ -113,6 +113,7 @@ static HTAB *GroupDataFilesByPartition(List *dataFiles, TimestampTz compactionSt
 static List *FilterCompactionCandidates(List *dataFiles, TimestampTz compactionStartTime, bool forceMerge,
 										bool forceCompactDeletions);
 static List *TryCompactDataFiles(Oid relationId, TupleDesc tupleDescriptor, List *candidates,
+								 CompactionStats * runStats,
 								 PgLakeTableType tableType, List *options, bool forceMerge, bool isVerbose);
 #ifdef USE_ASSERT_CHECKING
 static void AssertAllFilesHaveSamePartition(List *dataFiles);
@@ -149,7 +150,7 @@ int			TargetFileSizeMB = DEFAULT_TARGET_FILE_SIZE_MB;
 int			VacuumCompactMinInputFiles = DEFAULT_MIN_INPUT_FILES;
 
 /* pg_lake_table.write_log_level */
-int			WriteLogLevel = LOG;
+int			WriteLogLevel = DEBUG1;
 
 
 /*
@@ -710,7 +711,7 @@ RemoveAllDataFilesFromPgLakeCatalogFromTable(Oid relationId)
  */
 bool
 CompactDataFiles(Oid relationId, TimestampTz compactionStartTime,
-				 bool forceMerge, bool isVerbose)
+				 bool forceMerge, bool isVerbose, CompactionStats * runStats)
 {
 	/* prevent concurrent update/delete which might rewrite files too */
 	LockTableForUpdate(relationId);
@@ -765,7 +766,7 @@ CompactDataFiles(Oid relationId, TimestampTz compactionStartTime,
 	}
 
 	List	   *newFileOps = TryCompactDataFiles(relationId, tupleDescriptor, entry->dataFiles,
-												 tableType, options, forceMerge, isVerbose);
+												 runStats, tableType, options, forceMerge, isVerbose);
 
 	table_close(rel, NoLock);
 	PopActiveSnapshot();
@@ -811,6 +812,7 @@ AssertAllFilesHaveSamePartition(List *dataFiles)
  */
 static List *
 TryCompactDataFiles(Oid relationId, TupleDesc tupleDescriptor, List *candidates,
+					CompactionStats * runStats,
 					PgLakeTableType tableType, List *options, bool forceMerge, bool isVerbose)
 {
 #ifdef USE_ASSERT_CHECKING
@@ -866,6 +868,14 @@ TryCompactDataFiles(Oid relationId, TupleDesc tupleDescriptor, List *candidates,
 		stats.sourceRowCount += (uint64) dataFile->stats.rowCount - dataFile->stats.deletedRowCount;
 
 		fileSizeSum += dataFile->stats.fileSize;
+
+		if (runStats != NULL)
+		{
+			runStats->filesRemoved++;
+			runStats->bytesRemoved += dataFile->stats.fileSize;
+			runStats->rowsRemoved += dataFile->stats.rowCount - dataFile->stats.deletedRowCount;
+			runStats->positionDeletedRowsResolved += dataFile->stats.deletedRowCount;
+		}
 
 		filePathsToCompact = lappend(filePathsToCompact, dataFile->path);
 	}
@@ -952,6 +962,20 @@ TryCompactDataFiles(Oid relationId, TupleDesc tupleDescriptor, List *candidates,
 									   false /* wrapNativeTypes */ );
 
 	metadataOperations = list_concat(metadataOperations, newFileOps);
+
+	if (runStats != NULL)
+	{
+		ListCell   *newFileCell = NULL;
+
+		foreach(newFileCell, newFileOps)
+		{
+			TableMetadataOperation *addOp = lfirst(newFileCell);
+
+			runStats->filesAdded++;
+			runStats->bytesAdded += addOp->dataFileStats.fileSize;
+			runStats->rowsAdded += addOp->dataFileStats.rowCount;
+		}
+	}
 
 	if (hasRowIds)
 	{
