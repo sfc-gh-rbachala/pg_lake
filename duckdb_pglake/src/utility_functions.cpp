@@ -33,8 +33,8 @@ struct StatActivityFunctionData : public TableFunctionData
 {
 	/* Function state */
 	vector<shared_ptr<ClientContext>> connections;
-	int offset;
-	bool finished = false;
+	idx_t		offset = 0;
+	bool		finished = false;
 };
 
 
@@ -63,6 +63,14 @@ static unique_ptr<FunctionData> StatActivityBind(ClientContext &context,
 
 /*
  * StatActivityExecute implements the execution for pg_lake_stat_activity.
+ *
+ * The query and start-time fields on PgLakeQueryListener are mutated by
+ * QueryBegin / QueryEnd hooks running on the session's own thread; we
+ * are iterating from a different thread.  Use GetActiveQuery so we read
+ * those fields under the listener's mutex and skip sessions whose query
+ * starts or ends mid-iteration.  connectionId is set once at session
+ * initialization and never modified afterwards, so it is safe to read
+ * directly.
  */
 static void StatActivityExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &functionData = (StatActivityFunctionData &)*data_p.bind_data;
@@ -86,11 +94,14 @@ static void StatActivityExec(ClientContext &context, TableFunctionInput &data_p,
 			shared_ptr<PgLakeQueryListener> queryListener =
 				connection->registered_state->Get<PgLakeQueryListener>("pg_lake_query_listener");
 
-			if (queryListener && queryListener->isQueryActive)
+			string activeQuery;
+			timestamp_t activeStart;
+
+			if (queryListener && queryListener->GetActiveQuery(activeQuery, activeStart))
 			{
 				output.SetValue(0, rowsInChunk, Value::BIGINT(queryListener->connectionId));
-				output.SetValue(1, rowsInChunk, Value(queryListener->queryString));
-				output.SetValue(2, rowsInChunk, Value::TIMESTAMP(queryListener->queryStart));
+				output.SetValue(1, rowsInChunk, Value(activeQuery));
+				output.SetValue(2, rowsInChunk, Value::TIMESTAMP(activeStart));
 
 				rowsInChunk++;
 			}
